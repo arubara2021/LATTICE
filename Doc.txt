@@ -1,0 +1,1210 @@
+formula2onnx/
+│
+├── __init__.py              # Public API: from_formula("a + b * c")
+│
+├── lexer.py                 # String → Tokens
+│   ├── tokenize()           # "a+b*c" → ["a", "+", "b", "*", "c"]
+│   ├── handle_numbers()     # Detect numeric constants
+│   ├── handle_operators()   # Detect + - * / ^ etc
+│   └── handle_functions()   # Detect sin cos sqrt exp etc
+│
+├── parser.py                # Tokens → AST (tree structure)
+│   ├── parse_expression()   # Lowest precedence: + -
+│   ├── parse_term()         # Medium precedence: * /
+│   ├── parse_factor()       # Highest precedence: ^ unary -
+│   ├── parse_function()     # Handle sin(...) cos(...) etc
+│   └── parse_primary()      # Numbers, variables, parentheses
+│
+├── ast_nodes.py             # AST node definitions
+│   ├── BinaryOp             # left, op, right
+│   ├── UnaryOp              # op, operand
+│   ├── FunctionCall         # name, args
+│   ├── Variable             # name
+│   └── Constant             # value
+│
+├── graph_builder.py         # AST → ONNX nodes
+│   ├── build()              # Walk AST, create ONNX graph
+│   ├── map_operator()       # + → Add, * → Mul, etc
+│   ├── map_function()       # sin → Sin, exp → Exp, etc
+│   ├── create_input()       # Build value_info for variables
+│   └── create_output()      # Build value_info for result
+│
+├── op_registry.py           # Map math ops to ONNX ops
+│   ├── BINARY_OPS           # { "+": "Add", "-": "Sub", ... }
+│   ├── UNARY_OPS            # { "-": "Neg" }
+│   ├── FUNCTIONS            # { "sin": "Sin", "cos": "Cos", ... }
+│   └── get_opset_version()  # Which opset supports which ops
+│
+├── optimizer.py             # Optional: optimize before export
+│   ├── constant_fold()      # Pre-calculate constant sub-expressions
+│   └── remove_identity()    # Remove unnecessary nodes
+│
+├── exporter.py              # Final ONNX model creation
+│   ├── export_to_file()     # Save .onnx
+│   ├── export_to_bytes()    # Return as bytes
+│   └── validate()           # Check model is valid onnx
+│
+├── executor.py              # Run the model
+│   ├── create_session()     # Make ONNX Runtime session
+│   ├── run()                # Execute with input values
+│   └── benchmark()          # Measure execution time
+│
+├── utils.py                 # Helpers
+│   ├── infer_shape()        # Determine tensor shapes
+│   ├── dtype_mapping()      # Python float → TensorProto.FLOAT
+│   └── pretty_print()       # Debug: print graph structure
+│
+└── tests/
+    ├── test_lexer.py
+    ├── test_parser.py
+    ├── test_graph_builder.py
+    ├── test_basic_ops.py    # a + b, a * b - c
+    ├── test_trig.py         # sin, cos, tan
+    ├── test_complex.py      # nested formulas
+    └── test_benchmark.py    # speed comparisons
+
+
+══════════════════════════════════════════════════════════════════════
+  FORMULA2ONNX: PERFORMANCE OPTIMIZATION DOCUMENTATION
+  Goal: Run mathematical formulas faster than NumPy on CPU
+══════════════════════════════════════════════════════════════════════
+
+
+TABLE OF CONTENTS
+─────────────────
+  1.  Why NumPy Is Slow (The Hidden Truth)
+  2.  The Architecture: Current vs Optimized
+  3.  Phase 1: Graph Pattern Fusion
+  4.  Phase 2: Fused C Kernel Generation
+  5.  Phase 3: Memory Layout Optimization
+  6.  Phase 4: SIMD Auto-Vectorization
+  7.  Phase 5: Multi-Core Threading
+  8.  Phase 6: Cache-Aware Chunking
+  9.  Phase 7: Ahead-Of-Time Compilation
+  10. Expected Speedup At Each Phase
+  11. Implementation Priority
+  12. How Large Models Benefit
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 1: WHY NUMPY IS SLOW (THE HIDDEN TRUTH)
+══════════════════════════════════════════════════════════════════════
+
+
+NumPy is not slow because of math.
+NumPy is slow because of MEMORY.
+
+Every NumPy operation does this:
+
+    1. Read input array from RAM     (slow: 100+ CPU cycles)
+    2. Compute the operation         (fast: 1-5 CPU cycles)
+    3. Write output array to RAM     (slow: 100+ CPU cycles)
+
+For a formula with 10 operations on 1 million float32 elements:
+
+    NUMPY EXECUTION:
+    ────────────────
+    Op 1:  read 4MB from RAM → compute → write 4MB to RAM
+    Op 2:  read 4MB from RAM → compute → write 4MB to RAM
+    Op 3:  read 4MB from RAM → compute → write 4MB to RAM
+    Op 4:  read 4MB from RAM → compute → write 4MB to RAM
+    Op 5:  read 4MB from RAM → compute → write 4MB to RAM
+    ...
+    Op 10: read 4MB from RAM → compute → write 4MB to RAM
+
+    Total RAM traffic: ~80MB
+    At 50 GB/s bandwidth: ~1.6ms MINIMUM (just memory transfer)
+    Actual time: ~2-5ms (includes Python overhead, allocation, etc.)
+
+    OPTIMIZED EXECUTION:
+    ────────────────────
+    Read 4MB from RAM once
+    For each element i:
+        result[i] = op1(op2(op3(...(x[i])...)))
+        (all 10 operations happen in CPU registers/L1 cache)
+    Write 4MB to RAM once
+
+    Total RAM traffic: ~8MB
+    At 50 GB/s bandwidth: ~0.16ms MINIMUM
+    Actual time: ~0.2-0.4ms
+
+    SPEEDUP: 5-10x ON THE SAME CPU
+
+
+The memory hierarchy:
+
+    ┌──────────────────────────────────────────────┐
+    │  Register  │  0.3ns   │  256 bytes           │
+    │  L1 Cache  │  1ns     │  64 KB per core      │
+    │  L2 Cache  │  4ns     │  512 KB per core     │
+    │  L3 Cache  │  12ns    │  8-32 MB shared      │
+    │  RAM       │  100ns   │  16-64 GB            │
+    │  SSD       │  100us   │  500 GB - 4 TB       │
+    └──────────────────────────────────────────────┘
+
+    RAM is 100x SLOWER than L1 cache.
+    Every time NumPy writes an intermediate result to RAM
+    and reads it back, you lose 200 CPU cycles.
+
+
+    1 million float32 = 4 MB
+    ────────────────────────
+    L1:  64KB  → holds 16,384 elements  (0.0016 of 1M)
+    L2:  512KB → holds 131,072 elements (0.13 of 1M)
+    L3:  8MB   → holds 2,097,152 elements (2x 1M) ✓ fits
+    RAM: 16GB  → holds everything but SLOW
+
+
+    THE KEY INSIGHT:
+    ────────────────
+    If we can keep intermediate results in L1/L2 cache
+    instead of writing them to RAM, we get 100x less
+    memory latency per operation.
+
+    For 10 fused operations: 100 * 10 = 1000 cycles saved.
+    On 1M elements: 1000 * 1M = 1 billion cycles saved.
+    At 4 GHz: 1 billion cycles = 0.25 seconds saved.
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 2: THE ARCHITECTURE
+══════════════════════════════════════════════════════════════════════
+
+
+CURRENT ARCHITECTURE (what we have now):
+
+    Formula String
+        │
+        ▼
+    ┌──────────┐
+    │  LEXER   │  "a + b * c" → [IDENT(a), PLUS, IDENT(b), STAR, IDENT(c)]
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────┐
+    │  PARSER  │  tokens → AST tree
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────┐
+    │ OPTIMIZER│  simplify AST (constant fold, identity removal)
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────────┐
+    │GRAPH BUILDER │  AST → ONNX graph (one node per operation)
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │   EXECUTOR   │  ONNX Runtime executes nodes one by one
+    └──────────────┘
+
+    Problem: ONNX Runtime executes each node independently.
+    Each node reads from RAM and writes to RAM.
+    For 10 nodes on 1M elements: 10 RAM round trips.
+
+
+OPTIMIZED ARCHITECTURE (what we build):
+
+    Formula String
+        │
+        ▼
+    ┌──────────┐
+    │  LEXER   │  (same)
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────┐
+    │  PARSER  │  (same)
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────┐
+    │ OPTIMIZER│  (same + new fusion patterns)
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────────┐
+    │GRAPH BUILDER │  (same)
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────────┐
+    │  FUSION ENGINE   │  NEW: detect fusible patterns
+    │  Pattern Matcher │  rewrite graph with fused nodes
+    └────────┬─────────┘
+             │
+             ▼
+    ┌──────────────────────┐
+    │  KERNEL GENERATOR    │  NEW: generate C code for each
+    │  Code Generator      │  fused operation
+    └────────┬─────────────┘
+             │
+             ▼
+    ┌──────────────────────┐
+    │  OPTIMIZED EXECUTOR  │  NEW: compile + run fused kernels
+    │  Compiler + Runner   │  with SIMD, threading, caching
+    └──────────────────────┘
+
+    Benefit: One kernel reads RAM once, does all ops in cache,
+    writes RAM once. 5-10x faster.
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 3: PHASE 1 — GRAPH PATTERN FUSION
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Detect groups of ONNX nodes that can be merged into one.
+
+WHY:   Each fused group = one RAM round trip instead of many.
+
+
+PATTERN 1: Arithmetic Chains
+────────────────────────────
+
+    BEFORE (3 nodes, 3 RAM round trips):
+        Add(Mul(a, b), c)
+
+        Graph:  a ──┐
+                     ├── Mul → temp ──┐
+                b ──┘                 ├── Add → result
+                c ────────────────────┘
+
+        Execution:
+            RAM → read a,b → Mul → write temp to RAM
+            RAM → read temp,c → Add → write result to RAM
+            Total: ~24MB RAM traffic for 1M elements
+
+    AFTER (1 fused node, 1 RAM round trip):
+        FusedMulAdd(a, b, c)
+
+        Graph:  a ──┐
+                b ──┼── FusedMulAdd → result
+                c ──┘
+
+        Execution:
+            RAM → read a,b,c → for each i: result[i] = a[i]*b[i] + c[i]
+                    → write result to RAM
+            Total: ~16MB RAM traffic for 1M elements
+
+
+PATTERN 2: Trigonometric Identity
+─────────────────────────────────
+
+    BEFORE (6 nodes):
+        Add(Pow(Sin(x), 2), Pow(Cos(x), 2))
+
+        Graph:  x → Sin → Pow(_,2) ──┐
+                                      ├── Add → result
+                x → Cos → Pow(_,2) ──┘
+
+        Execution:
+            read x → sin → write to RAM (4MB)
+            read from RAM → pow → write to RAM (4MB)
+            read x → cos → write to RAM (4MB)
+            read from RAM → pow → write to RAM (4MB)
+            read both → add → write to RAM (4MB)
+            Total: ~32MB RAM traffic
+
+    AFTER (1 fused node):
+        FusedSin2Cos2(x)
+
+        Graph:  x → FusedSin2Cos2 → result
+
+        Execution:
+            read x → for each i: result[i] = sin(x[i])^2 + cos(x[i])^2
+                    → write result to RAM
+            Total: ~8MB RAM traffic
+
+    SPEEDUP: 4x just from fusion. No SIMD, no threading.
+
+
+PATTERN 3: Euclidean Distance
+─────────────────────────────
+
+    BEFORE (5 nodes):
+        Sqrt(Add(Pow(a, 2), Pow(b, 2)))
+
+        Graph:  a → Pow(_,2) ───┐
+                                 ├── Add → Sqrt → result
+                b → Pow(_,2) ───┘
+
+    AFTER (1 fused node):
+        FusedHypot(a, b)
+
+        Graph:  a ──┐
+                     ├── FusedHypot → result
+                b ──┘
+
+        Execution:
+            read a,b → for each i: result[i] = sqrt(a[i]*a[i] + b[i]*b[i])
+            write result
+
+    SPEEDUP: 3-5x
+
+
+PATTERN 4: Exponential Decay
+────────────────────────────
+
+    BEFORE (4 nodes):
+        Mul(A, Exp(Neg(Mul(lambda, t))))
+
+        Graph:  lambda → Mul ──→ Neg → Exp ──┐
+                t ──────┘                     ├── Mul → result
+                A ────────────────────────────┘
+
+    AFTER (1 fused node):
+        FusedExpDecay(A, lambda, t)
+
+        Execution:
+            for each i: result[i] = A[i] * exp(-lambda[i] * t[i])
+
+
+PATTERN 5: Gaussian
+───────────────────
+
+    BEFORE (8 nodes):
+        Mul(A, Exp(Neg(Div(Pow(Sub(x, mu), 2), Mul(2, Pow(sigma, 2))))))
+
+    AFTER (1 fused node):
+        FusedGaussian(A, mu, sigma, x)
+
+        Execution:
+            for each i:
+                z = (x[i] - mu[i]) / sigma[i]
+                result[i] = A[i] * exp(-0.5 * z * z)
+
+
+PATTERN 6: Softmax (common in ML)
+──────────────────────────────────
+
+    BEFORE:  Exp(x) / Sum(Exp(x))
+
+    AFTER:   FusedSoftmax(x)
+
+
+COMPLETE PATTERN LIST:
+──────────────────────
+
+    Pattern Name         Nodes Fused    Example Formula
+    ────────────         ───────────    ───────────────
+    FusedMulAdd          3→1            a * b + c
+    FusedSquare          2→1            a ^ 2
+    FusedSquareAdd       4→1            a ^ 2 + b ^ 2
+    FusedHypot           5→1            sqrt(a^2 + b^2)
+    FusedSin2Cos2        6→1            sin(x)^2 + cos(x)^2
+    FusedExpDecay        4→1            A * exp(-lambda * t)
+    FusedGaussian        8→1            A * exp(-(x-mu)^2 / (2*sigma^2))
+    FusedPolynomial      N→1            a*x^3 + b*x^2 + c*x + d
+    FusedSigmoid         3→1            1 / (1 + exp(-x))
+    FusedReLU            2→1            max(0, x)
+    FusedLayerNorm       5→1            (x - mean) / sqrt(var + eps)
+    FusedSoftmax         3→1            exp(x) / sum(exp(x))
+
+
+IMPLEMENTATION:
+───────────────
+
+    1. Walk the ONNX graph
+    2. At each node, check if it matches a known pattern
+    3. If match: replace the group of nodes with one fused node
+    4. Repeat until no more patterns match
+
+    New file: fusion_engine.py
+    New file: fusion_patterns.py
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 4: PHASE 2 — FUSED C KERNEL GENERATION
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Generate optimized C code for each fused operation.
+
+WHY:   C is 10-100x faster than Python for tight loops.
+       The compiler (GCC/Clang) auto-vectorizes to SIMD.
+
+
+HOW IT WORKS:
+─────────────
+
+    Input:  FusedMulAdd(a, b, c)    (from Phase 1)
+
+    Generated C code:
+
+        void fused_mul_add(
+            const float* a,
+            const float* b,
+            const float* c,
+            float* result,
+            size_t n
+        ) {
+            for (size_t i = 0; i < n; i++) {
+                result[i] = a[i] * b[i] + c[i];
+            }
+        }
+
+    With SIMD hints:
+
+        void fused_mul_add_simd(
+            const float* a,
+            const float* b,
+            const float* c,
+            float* result,
+            size_t n
+        ) {
+            #pragma omp simd
+            for (size_t i = 0; i < n; i++) {
+                result[i] = a[i] * b[i] + c[i];
+            }
+        }
+
+    With OpenMP threading:
+
+        void fused_mul_add_parallel(
+            const float* a,
+            const float* b,
+            const float* c,
+            float* result,
+            size_t n
+        ) {
+            #pragma omp parallel for simd
+            for (size_t i = 0; i < n; i++) {
+                result[i] = a[i] * b[i] + c[i];
+            }
+        }
+
+    With chunking (cache-aware):
+
+        void fused_mul_add_chunked(
+            const float* a,
+            const float* b,
+            const float* c,
+            float* result,
+            size_t n
+        ) {
+            const size_t CHUNK = 131072;  // 512KB = fits in L2 cache
+            for (size_t start = 0; start < n; start += CHUNK) {
+                size_t end = (start + CHUNK < n) ? start + CHUNK : n;
+                #pragma omp parallel for simd
+                for (size_t i = start; i < end; i++) {
+                    result[i] = a[i] * b[i] + c[i];
+                }
+            }
+        }
+
+
+    A more complex example: FusedGaussian
+
+        void fused_gaussian(
+            const float* A,
+            const float* mu,
+            const float* sigma,
+            const float* x,
+            float* result,
+            size_t n
+        ) {
+            #pragma omp parallel for simd
+            for (size_t i = 0; i < n; i++) {
+                float z = (x[i] - mu[i]) / sigma[i];
+                result[i] = A[i] * expf(-0.5f * z * z);
+            }
+        }
+
+
+    NumPy equivalent (what we are competing against):
+
+        result = A * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+        NumPy does this internally:
+            temp1 = x - mu           → read x,mu → write temp1 (RAM)
+            temp2 = sigma            → read sigma (RAM)
+            temp3 = temp1 / temp2    → read temp1,temp2 → write temp3 (RAM)
+            temp4 = temp3 ** 2       → read temp3 → write temp4 (RAM)
+            temp5 = -0.5 * temp4     → read temp4 → write temp5 (RAM)
+            temp6 = np.exp(temp5)    → read temp5 → write temp6 (RAM)
+            result = A * temp6       → read A,temp6 → write result (RAM)
+
+            7 RAM round trips = ~56MB for 1M elements
+
+        Our fused version:
+            1 RAM round trip = ~20MB for 1M elements
+
+        SPEEDUP: ~2.8x just from fusion. Add SIMD/threading: ~8-15x.
+
+
+COMPILATION PIPELINE:
+─────────────────────
+
+    Pattern detected
+         │
+         ▼
+    ┌──────────────────┐
+    │  CODE GENERATOR  │  Pattern → C source code
+    └────────┬─────────┘
+             │
+             ▼
+    ┌──────────────────┐
+    │  COMPILER (GCC)  │  C source → shared library (.so / .dll)
+    └────────┬─────────┘
+             │
+             ▼
+    ┌──────────────────┐
+    │  FFI LOADER      │  Load .so/.dll, create Python callable
+    │  (ctypes/cffi)   │
+    └────────┬─────────┘
+             │
+             ▼
+    ┌──────────────────┐
+    │  EXECUTOR        │  Call fused kernel directly
+    └──────────────────┘
+
+
+LIBRARIES NEEDED:
+─────────────────
+
+    ctypes      →  built into Python, call C functions
+    cffi        →  faster alternative to ctypes
+    cffi  + gcc →  compile C on the fly
+
+    pip install cffi
+
+    Or use the subprocess module to call gcc directly:
+
+        import subprocess
+        subprocess.run(["gcc", "-O3", "-march=native", "-shared",
+                        "-fPIC", "-o", "kernel.so", "kernel.c"])
+
+
+NEW FILES:
+──────────
+
+    kernel_generator.py     →  generates C code from fused patterns
+    compiler.py             →  compiles C to shared library
+    kernel_loader.py        →  loads and calls compiled kernels
+    kernels/                →  directory for generated .c and .so files
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 5: PHASE 3 — MEMORY LAYOUT OPTIMIZATION
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Control how data is arranged in memory.
+
+WHY:   Contiguous, aligned data = faster SIMD, fewer cache misses.
+
+
+OPTIMIZATION 1: Alignment
+─────────────────────────
+
+    NumPy arrays may not be aligned to 64-byte boundaries.
+    AVX-512 requires 64-byte alignment for best performance.
+
+    Unaligned:    data at address 0x7f3a0001 (offset 1 byte)
+                  SIMD load: 2 cycles (must cross cache line)
+
+    Aligned:      data at address 0x7f3a0040 (64-byte boundary)
+                  SIMD load: 1 cycle (single cache line)
+
+    Fix: Allocate aligned buffers.
+
+        import ctypes
+        def aligned_zeros(n, alignment=64):
+            size = n * 4  # float32 = 4 bytes
+            buf = (ctypes.c_char * (size + alignment))()
+            addr = ctypes.addressof(buf)
+            offset = (alignment - addr % alignment) % alignment
+            arr = (ctypes.c_float * n).from_buffer(buf, offset)
+            return arr
+
+
+OPTIMIZATION 2: Contiguous Memory
+──────────────────────────────────
+
+    NumPy arrays can be non-contiguous (after slicing, transposing).
+
+    Contiguous:       [1][2][3][4][5][6][7][8]  ← sequential in RAM
+    Non-contiguous:   [1][?][2][?][3][?][4][?]  ← every other element
+
+    Non-contiguous access:
+        - 2x more cache lines loaded
+        - SIMD prefetcher confused
+        - 2-4x slower
+
+    Fix: Always call .copy() or np.ascontiguousarray() before passing
+    to fused kernels.
+
+
+OPTIMIZATION 3: Structure of Arrays (SoA) vs Array of Structures (AoS)
+───────────────────────────────────────────────────────────────────────
+
+    Formula: sin(a) + cos(b) * sqrt(a^2 + b^2)
+
+    AoS layout (interleaved):
+        [a0, b0, a1, b1, a2, b2, a3, b3, ...]
+        To read all 'a' values: load every other element (bad)
+
+    SoA layout (separate):
+        a: [a0, a1, a2, a3, ...]
+        b: [b0, b1, b2, b3, ...]
+        To read all 'a' values: sequential load (good)
+
+    NumPy already uses SoA. We keep this layout.
+    But when multiple arrays share the same operation,
+    we can interleave the reads for better cache usage.
+
+
+NEW FILES:
+──────────
+
+    memory_optimizer.py    →  alignment, contiguity checks
+    buffer_pool.py         →  pre-allocated buffer reuse
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 6: PHASE 4 — SIMD AUTO-VECTORIZATION
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Process multiple elements per CPU instruction.
+
+WHY:   4x-16x speedup from SIMD alone.
+
+
+HOW SIMD WORKS:
+───────────────
+
+    Without SIMD (scalar):
+        add result[0] = a[0] + b[0]     (1 cycle)
+        add result[1] = a[1] + b[1]     (1 cycle)
+        add result[2] = a[2] + b[2]     (1 cycle)
+        add result[3] = a[3] + b[3]     (1 cycle)
+        Total: 4 cycles for 4 elements
+
+    With SSE (128-bit, 4 floats):
+        vaddps result, a, b             (1 cycle, processes 4 floats)
+        Total: 1 cycle for 4 elements    → 4x faster
+
+    With AVX2 (256-bit, 8 floats):
+        vaddps result, a, b             (1 cycle, processes 8 floats)
+        Total: 1 cycle for 8 elements    → 8x faster
+
+    With AVX-512 (512-bit, 16 floats):
+        vaddps result, a, b             (1 cycle, processes 16 floats)
+        Total: 1 cycle for 16 elements   → 16x faster
+
+
+SIMD SUPPORT BY CPU:
+────────────────────
+
+    SSE4.2    (2008):  128-bit  →  4 float32/cycle
+    AVX       (2011):  256-bit  →  8 float32/cycle
+    AVX2      (2013):  256-bit  →  8 float32/cycle (+ integer)
+    AVX-512   (2017):  512-bit  →  16 float32/cycle
+
+    The GCC compiler auto-vectorizes with -O3 -march=native.
+    We just need to write clean, vectorizable C loops.
+
+
+HOW TO GET SIMD:
+────────────────
+
+    Method 1: Let GCC do it (easiest)
+
+        #pragma omp simd
+        for (int i = 0; i < n; i++) {
+            result[i] = sinf(x[i]) * cosf(x[i]);
+        }
+
+        Compile with: gcc -O3 -march=native -fopenmp -shared -fPIC
+
+    Method 2: Compiler intrinsics (hardest, most control)
+
+        #include <immintrin.h>
+        void add_avx(const float* a, const float* b, float* r, int n) {
+            for (int i = 0; i < n; i += 8) {
+                __m256 va = _mm256_load_ps(a + i);
+                __m256 vb = _mm256_load_ps(b + i);
+                __m256 vr = _mm256_add_ps(va, vb);
+                _mm256_store_ps(r + i, vr);
+            }
+        }
+
+    Method 3: Compiler pragma hints (balanced)
+
+        #pragma GCC optimize("O3,unroll-loops")
+        #pragma GCC target("avx2,fma")
+        void fused_kernel(...) {
+            ...
+        }
+
+    We use Method 1 + Method 3 combined.
+    GCC handles the heavy lifting.
+
+
+NUMPY AND SIMD:
+───────────────
+
+    NumPy already uses SIMD for EACH INDIVIDUAL operation.
+    sin(x)     → uses AVX2 internally for the sin computation
+    cos(x)     → uses AVX2 internally for the cos computation
+    pow(x, 2)  → uses AVX2 for multiplication
+
+    But NumPy does NOT fuse operations.
+    So between sin(x) and cos(x), the data goes to RAM and back.
+
+    Our advantage: we fuse AND use SIMD.
+    Same SIMD speed per operation, but 5-10x fewer memory round trips.
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 7: PHASE 5 — MULTI-CORE THREADING
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Split work across all CPU cores.
+
+WHY:   8-core CPU = up to 8x speedup.
+
+
+HOW THREADING WORKS:
+────────────────────
+
+    Single-threaded:
+        Core 0: [element 0 to 999999]  →  all work on one core
+        Core 1: idle
+        Core 2: idle
+        ...
+
+    Multi-threaded (8 cores):
+        Core 0: [element 0 to 124999]
+        Core 1: [element 125000 to 249999]
+        Core 2: [element 250000 to 374999]
+        Core 3: [element 375000 to 499999]
+        Core 4: [element 500000 to 624999]
+        Core 5: [element 625000 to 749999]
+        Core 6: [element 750000 to 874999]
+        Core 7: [element 875000 to 999999]
+        →  ~8x faster
+
+
+HOW TO GET THREADING:
+─────────────────────
+
+    Method 1: OpenMP (easiest, recommended)
+
+        #pragma omp parallel for simd
+        for (int i = 0; i < n; i++) {
+            result[i] = a[i] * b[i] + c[i];
+        }
+
+        Compile with: gcc -O3 -march=native -fopenmp -shared -fPIC
+
+        OpenMP automatically:
+            - Splits work across all cores
+            - Uses SIMD within each core
+            - Handles load balancing
+
+    Method 2: Python threading (fallback)
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            chunks = np.array_split(data, os.cpu_count())
+            results = list(executor.map(process_chunk, chunks))
+
+
+WHEN THREADING HELPS:
+─────────────────────
+
+    Small arrays (< 10,000 elements):
+        Threading overhead > computation
+        → Do NOT thread. Run single-threaded.
+
+    Medium arrays (10,000 - 100,000):
+        Threading helps slightly (2-3x on 8 cores)
+        → Use 2-4 threads.
+
+    Large arrays (100,000+):
+        Threading helps a lot (5-8x on 8 cores)
+        → Use all cores.
+
+    The executor should auto-detect array size and choose
+    thread count accordingly.
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 8: PHASE 6 — CACHE-AWARE CHUNKING
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Process data in chunks that fit in CPU cache.
+
+WHY:   If data fits in L2 cache, RAM latency disappears.
+
+
+THE PROBLEM:
+────────────
+
+    10 million float32 elements = 40MB
+    L3 cache = 8-32MB
+    → Data does NOT fit in L3 for many CPUs
+    → Every access goes to slow RAM
+
+
+THE SOLUTION:
+─────────────
+
+    Process in chunks that fit in L2 (512KB per core):
+
+        CHUNK_SIZE = 131072 elements  (512KB for float32)
+
+        For chunk in chunks:
+            1. Load chunk from RAM to L2 cache
+            2. Compute ALL fused operations on chunk
+               (data stays in L2 the entire time)
+            3. Write chunk result back to RAM
+
+    Each chunk = one RAM round trip.
+    All intermediate computations happen in L2 cache.
+
+
+EXAMPLE:
+────────
+
+    Formula:  sin(a) * cos(b) + sqrt(a^2 + b^2)
+    Size: 10,000,000 elements
+    Chunk: 131,072 elements (512KB)
+
+    WITHOUT CHUNKING (NumPy way):
+        read a (40MB) → sin → write sin_a (40MB)         → RAM
+        read b (40MB) → cos → write cos_b (40MB)         → RAM
+        read a (40MB) → a^2 → write a2 (40MB)            → RAM
+        read b (40MB) → b^2 → write b2 (40MB)            → RAM
+        read a2,b2 (80MB) → add → write sum (40MB)       → RAM
+        read sum (40MB) → sqrt → write sq (40MB)         → RAM
+        read sin_a,cos_b (80MB) → mul → write mul (40MB) → RAM
+        read mul,sq (80MB) → add → write result (40MB)   → RAM
+        Total: ~520MB RAM traffic
+
+    WITH CHUNKING + FUSION:
+        For each of 76 chunks:
+            read a_chunk, b_chunk (1MB) from RAM to L2
+            for each element:
+                result[i] = sin(a[i])*cos(b[i]) + sqrt(a[i]^2+b[i]^2)
+            write result_chunk (0.5MB) to RAM
+        Total per chunk: ~1.5MB
+        Total for all chunks: ~114MB RAM traffic
+
+    SPEEDUP: 520 / 114 = 4.6x just from chunking + fusion.
+
+
+NEW FILES:
+──────────
+
+    chunking_engine.py    →  automatic chunk size selection
+    execution_planner.py  →  decide threading + chunking strategy
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 9: PHASE 7 — AHEAD-OF-TIME COMPILATION
+══════════════════════════════════════════════════════════════════════
+
+
+WHAT:  Compile the formula to a standalone binary.
+
+WHY:   Zero Python overhead. Zero ONNX overhead. Raw C speed.
+
+
+CURRENT OVERHEAD PER CALL:
+──────────────────────────
+
+    Python function call:         ~0.001ms
+    NumPy dispatch:               ~0.01ms
+    ONNX session.run():           ~0.02ms
+    ONNX graph traversal:         ~0.005ms
+    Memory copy (numpy → C):      ~0.001ms
+
+    Total overhead: ~0.03ms per call
+
+    For 1M elements at ~0.5ms compute time: overhead = 6%
+    For 100K elements at ~0.05ms compute time: overhead = 60%  ← PROBLEM
+
+
+AOT COMPILATION:
+────────────────
+
+    Input:  formula "sin(a) + cos(b) * sqrt(a^2 + b^2)"
+
+    Step 1: Parse → AST
+    Step 2: Fuse patterns → fused graph
+    Step 3: Generate C code for entire formula
+    Step 4: Compile to native binary
+
+    Output: formula_kernel.so (or .dll on Windows)
+
+    Usage from Python:
+
+        import ctypes
+        lib = ctypes.CDLL("./formula_kernel.so")
+
+        # Call directly, no Python overhead
+        lib.formula(
+            a_ptr, b_ptr, result_ptr, n
+        )
+
+    Usage from C/C++:
+
+        #include "formula_kernel.h"
+        formula(a, b, result, n);
+
+    Usage from any language with FFI.
+
+
+    COMPILED C CODE (full formula):
+
+        #include <math.h>
+        #include <omp.h>
+
+        void formula(
+            const float* a,
+            const float* b,
+            float* result,
+            size_t n
+        ) {
+            #pragma omp parallel for simd schedule(static)
+            for (size_t i = 0; i < n; i++) {
+                float a_val = a[i];
+                float b_val = b[i];
+                float a2 = a_val * a_val;
+                float b2 = b_val * b_val;
+                float hypot = sqrtf(a2 + b2);
+                result[i] = sinf(a_val) + cosf(b_val) * hypot;
+            }
+        }
+
+    Compile:
+
+        gcc -O3 -march=native -fopenmp -shared -fPIC \
+            -o formula_kernel.so formula_kernel.c -lm
+
+
+    This binary:
+        - Has ZERO Python overhead
+        - Has ZERO ONNX overhead
+        - Uses SIMD (auto-vectorized by GCC)
+        - Uses all CPU cores (OpenMP)
+        - Fuses all operations (one loop)
+        - Runs at native C speed
+
+
+NEW FILES:
+──────────
+
+    aot_compiler.py          →  AST → C code → compiled binary
+    templates/               →  C code templates for each pattern
+    c_code_generator.py      →  generates C source from fused graph
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 10: EXPECTED SPEEDUP AT EACH PHASE
+══════════════════════════════════════════════════════════════════════
+
+
+Formula: sin(a) + cos(b) * sqrt(a^2 + b^2)
+Size: 1,000,000 float32 elements
+Hardware: 8-core CPU, AVX2
+
+
+    Phase                    Technique              Time(ms)   vs NumPy
+    ─────                    ─────────              ────────   ────────
+    Current (ONNX)           individual ops         1.50       1.0x
+    Phase 1                  pattern fusion         0.60       2.5x
+    Phase 2                  fused C kernels        0.45       3.3x
+    Phase 3                  memory alignment       0.40       3.8x
+    Phase 4                  SIMD hints             0.25       6.0x
+    Phase 5                  multi-threading         0.10      15.0x
+    Phase 6                  cache chunking          0.08      18.8x
+    Phase 7                  AOT compilation         0.06      25.0x
+
+
+    ┌────────────────────────────────────────────────────────┐
+    │                                                        │
+    │   NumPy:          ████████████████████  1.50ms         │
+    │                                                        │
+    │   ONNX Current:   ████████████████████  1.50ms         │
+    │                                                        │
+    │   Phase 1:        ████████              0.60ms  2.5x   │
+    │                                                        │
+    │   Phase 2:        ██████                0.45ms  3.3x   │
+    │                                                        │
+    │   Phase 4:        ████                  0.25ms  6.0x   │
+    │                                                        │
+    │   Phase 5:        ██                    0.10ms  15.0x  │
+    │                                                        │
+    │   Phase 7:        █                     0.06ms  25.0x  │
+    │                                                        │
+    └────────────────────────────────────────────────────────┘
+
+
+    For LARGE MODELS (many operations, big tensors):
+
+    10 operations, 100 million elements:
+
+    NumPy:     10 separate RAM round trips × 400MB = 4GB traffic
+               At 50 GB/s: ~80ms
+               Python overhead: ~5ms
+               Total: ~85ms
+
+    Optimized: 1 fused RAM round trip × 400MB = 400MB traffic
+               At 50 GB/s: ~8ms
+               Multi-threaded: ~1ms
+               Overhead: ~0.01ms
+               Total: ~1.01ms
+
+    SPEEDUP: ~84x
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 11: IMPLEMENTATION PRIORITY
+══════════════════════════════════════════════════════════════════════
+
+
+    Priority  Phase  Effort   Impact  Files
+    ────────  ─────  ──────   ──────  ─────
+    1         1      2 days   2.5x    fusion_engine.py, fusion_patterns.py
+    2         2      3 days   3.3x    kernel_generator.py, compiler.py
+    3         4      1 day    6.0x    GCC flags in compiler.py
+    4         5      1 day    15.0x   OpenMP pragma in kernel_generator.py
+    5         6      2 days   18.8x   chunking_engine.py
+    6         3      1 day    3.8x    memory_optimizer.py
+    7         7      3 days   25.0x   aot_compiler.py
+
+    TOTAL: ~13 days for 25x speedup over NumPy.
+
+
+    START HERE (day 1-2):
+    ─────────────────────
+    1. Build fusion_engine.py
+    2. Implement 5 basic patterns (MulAdd, Square, Hypot, Sin2Cos2, ExpDecay)
+    3. Test: verify fused results match unfused results
+    4. Measure: how much speedup from fusion alone
+
+
+    THEN (day 3-5):
+    ───────────────
+    5. Build kernel_generator.py
+    6. Generate C code for each fused pattern
+    7. Build compiler.py (call gcc)
+    8. Build kernel_loader.py (ctypes/cffi)
+    9. Test: generated C code produces correct results
+
+
+    THEN (day 6-7):
+    ───────────────
+    10. Add -O3 -march=native flags (SIMD)
+    11. Add #pragma omp parallel for simd (threading)
+    12. Test on various array sizes
+    13. Auto-detect optimal thread count per array size
+
+
+    THEN (day 8-9):
+    ───────────────
+    14. Build chunking_engine.py
+    15. Auto-detect L2/L3 cache sizes
+    16. Choose optimal chunk size
+    17. Test on arrays larger than L3 cache
+
+
+    THEN (day 10-11):
+    ─────────────────
+    18. Memory alignment
+    19. Contiguity checks
+    20. Buffer pooling (reuse allocations)
+
+
+    THEN (day 12-13):
+    ─────────────────
+    21. AOT compiler
+    22. Generate standalone .so/.dll
+    23. Zero-overhead direct calls
+    24. Benchmark everything
+
+
+══════════════════════════════════════════════════════════════════════
+  SECTION 12: HOW LARGE MODELS BENEFIT
+══════════════════════════════════════════════════════════════════════
+
+
+Large models (LLMs, diffusion models, neural networks) have
+thousands of operations on massive tensors.
+
+    Model Component          Operations    Tensor Size     NumPy     Optimized
+    ───────────────          ──────────    ───────────     ─────     ─────────
+    Attention (Q*K^T)        3             1M x 128        5ms       0.3ms
+    Softmax                  3             1M x 128        3ms       0.2ms
+    Layer Normalization      5             1M x 768        8ms       0.5ms
+    Feed Forward (gelu)      4             1M x 3072       15ms      1.0ms
+    Positional Encoding      2             1M x 128        2ms       0.1ms
+    Cross Entropy Loss       4             1M x 50000      25ms      1.5ms
+    ─────────────────────────────────────────────────────────────────────────
+    Total per layer          21            -               58ms      3.6ms
+    12 layers                252           -               696ms     43.2ms
+    Full forward pass        ~500          -               ~1.4s     ~0.1s
+
+
+    SPEEDUP: 10-15x for full model forward pass on CPU.
+
+    This makes CPU inference for large models VIABLE.
+    Without optimization: 1.4 seconds per token (too slow).
+    With optimization: 0.1 seconds per token (10 tokens/sec).
+
+
+    ADDITIONAL LARGE MODEL OPTIMIZATIONS:
+    ─────────────────────────────────────
+
+    1. Operator-level fusion across the entire model graph
+       (not just within one formula)
+
+    2. Weight pre-computation
+       (bake constant weights into the fused kernel)
+
+    3. Mixed precision (float16 for some ops, float32 for sensitive ops)
+       → 2x less memory bandwidth, 2x more SIMD throughput
+
+    4. Quantized inference (int8 for matrix multiply)
+       → 4x less memory, 4x more SIMD throughput
+
+    5. Memory-mapped weights
+       (load weights from SSD directly, no RAM copy)
+
+
+══════════════════════════════════════════════════════════════════════
+  SUMMARY
+══════════════════════════════════════════════════════════════════════
+
+
+    Can you beat NumPy on CPU?          YES.
+    Is it easy?                         No. But it is well-understood.
+    How much faster?                    10-25x for single formulas.
+                                        10-15x for full model inference.
+    What is the secret?                 Memory, not math.
+    What is the biggest win?            Operation fusion (Phase 1+2).
+    What is the easiest win?            OpenMP threading (one pragma line).
+    How long to implement?              ~13 days for full optimization.
+    Is it worth it for large models?    Absolutely. 1.4s → 0.1s per token.
+
+
+    THE ONE RULE:
+    ─────────────
+    Every time you eliminate a RAM round trip, you save ~100ns per element.
+    For 1M elements, that is 0.1ms.
+    Eliminate 10 round trips: save 1ms.
+    That is the difference between "too slow" and "fast enough."
+
+
+══════════════════════════════════════════════════════════════════════
+  END OF DOCUMENTATION
+══════════════════════════════════════════════════════════════════════

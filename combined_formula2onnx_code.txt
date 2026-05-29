@@ -1,0 +1,1333 @@
+
+==================================================
+FILE: ast_nodes.py
+==================================================
+
+class BinaryOp:
+    def __init__(self, left, op, right):
+        self.left = left
+        self.op = op
+        self.right = right
+
+    def __repr__(self):
+        return f"BinaryOp({self.left}, {self.op}, {self.right})"
+
+
+class UnaryOp:
+    def __init__(self, op, operand):
+        self.op = op
+        self.operand = operand
+
+    def __repr__(self):
+        return f"UnaryOp({self.op}, {self.operand})"
+
+
+class FunctionCall:
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
+
+    def __repr__(self):
+        return f"FunctionCall({self.name}, {self.args})"
+
+
+class Variable:
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return f"Variable({self.name})"
+
+
+class Constant:
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self):
+        return f"Constant({self.value})"
+
+
+
+==================================================
+FILE: executor.py
+==================================================
+
+import time
+import warnings
+import numpy as np
+import onnxruntime as ort
+
+
+class Executor:
+    def __init__(self):
+        self.session = None
+
+    def create_session(self, model_path):
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 3
+        self.session = ort.InferenceSession(model_path, sess_options)
+        return self.session
+
+    def run(self, inputs):
+        input_feed = {}
+        is_scalar = True
+
+        for name, value in inputs.items():
+            if isinstance(value, np.ndarray):
+                input_feed[name] = value.astype(np.float32)
+                is_scalar = False
+            elif isinstance(value, (list, tuple)):
+                input_feed[name] = np.array(value, dtype=np.float32)
+                is_scalar = False
+            else:
+                input_feed[name] = np.array([value], dtype=np.float32)
+
+        result = self.session.run(None, input_feed)[0]
+
+        if is_scalar:
+            return float(result.flat[0])
+        return result
+
+    def benchmark(self, inputs, runs=1000):
+        input_feed = {}
+        is_scalar = True
+
+        for name, value in inputs.items():
+            if isinstance(value, np.ndarray):
+                input_feed[name] = value.astype(np.float32)
+                is_scalar = False
+            elif isinstance(value, (list, tuple)):
+                input_feed[name] = np.array(value, dtype=np.float32)
+                is_scalar = False
+            else:
+                input_feed[name] = np.array([value], dtype=np.float32)
+
+        self.session.run(None, input_feed)
+
+        start = time.perf_counter()
+        for _ in range(runs):
+            self.session.run(None, input_feed)
+        end = time.perf_counter()
+
+        total_time = end - start
+        avg_time = total_time / runs
+
+        num_elements = 1
+        for v in input_feed.values():
+            num_elements = max(num_elements, v.size)
+
+        return {
+            'total_time': total_time,
+            'avg_time': avg_time,
+            'runs': runs,
+            'runs_per_second': runs / total_time,
+            'elements_per_second': (runs * num_elements) / total_time
+        }
+
+==================================================
+FILE: exporter.py
+==================================================
+
+import onnx
+
+
+class Exporter:
+    def export_to_file(self, model, filepath):
+        onnx.save(model, filepath)
+        return filepath
+
+    def export_to_bytes(self, model):
+        return model.SerializeToString()
+
+    def validate(self, model, strict=True):
+        if strict:
+            onnx.checker.check_model(model)
+        else:
+            try:
+                onnx.checker.check_model(model)
+            except onnx.checker.ValidationError:
+                pass
+        return True
+
+==================================================
+FILE: graph_builder.py
+==================================================
+
+import onnx
+from onnx import helper, TensorProto
+from .ast_nodes import *
+from .op_registry import (
+    get_binary_op, get_unary_op, get_comparison_op,
+    get_function, get_constant, is_special_function,
+    is_constant, get_opset_version
+)
+
+COMPARISON_OPS = {'<', '>', '<=', '>=', '==', '!='}
+
+
+class GraphBuilder:
+    def __init__(self, shapes=None, dynamic=False):
+        self.shapes = shapes or {}
+        self.dynamic = dynamic
+        self.nodes = []
+        self.inputs = []
+        self.outputs = []
+        self.initializers = []
+        self.variables_seen = set()
+        self.constants_seen = {}
+        self.counter = 0
+        self.output_shape = [1]
+
+    def get_name(self, prefix):
+        name = f"{prefix}_{self.counter}"
+        self.counter += 1
+        return name
+
+    def build(self, ast):
+        output_name = self.visit(ast)
+
+        if isinstance(ast, BinaryOp) and ast.op in COMPARISON_OPS:
+            output_type = TensorProto.BOOL
+        else:
+            output_type = TensorProto.FLOAT
+
+        self.create_output(output_name, output_type)
+        graph = helper.make_graph(
+            self.nodes,
+            "formula_graph",
+            self.inputs,
+            self.outputs,
+            initializer=self.initializers
+        )
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid("", get_opset_version())
+        ])
+        return model
+
+    def visit(self, node):
+        if isinstance(node, BinaryOp):
+            return self.visit_binary_op(node)
+        if isinstance(node, UnaryOp):
+            return self.visit_unary_op(node)
+        if isinstance(node, FunctionCall):
+            return self.visit_function_call(node)
+        if isinstance(node, Variable):
+            return self.visit_variable(node)
+        if isinstance(node, Constant):
+            return self.visit_constant(node)
+        raise Exception(f"Unknown node type: {type(node)}")
+
+    def visit_binary_op(self, node):
+        left_name = self.visit(node.left)
+        right_name = self.visit(node.right)
+
+        if node.op == '!=':
+            eq_name = self.get_name("eq")
+            self.nodes.append(helper.make_node(
+                "Equal", [left_name, right_name], [eq_name]
+            ))
+            not_name = self.get_name("not")
+            self.nodes.append(helper.make_node(
+                "Not", [eq_name], [not_name]
+            ))
+            return not_name
+
+        if node.op == '%':
+            output_name = self.get_name("mod")
+            self.nodes.append(helper.make_node(
+                "Mod", [left_name, right_name], [output_name],
+                fmod=1
+            ))
+            return output_name
+
+        try:
+            onnx_op = get_binary_op(node.op)
+        except Exception:
+            onnx_op = get_comparison_op(node.op)
+
+        output_name = self.get_name(onnx_op.lower())
+        self.nodes.append(helper.make_node(
+            onnx_op, [left_name, right_name], [output_name]
+        ))
+        return output_name
+
+    def visit_unary_op(self, node):
+        operand_name = self.visit(node.operand)
+        onnx_op = get_unary_op(node.op)
+        if onnx_op is None:
+            return operand_name
+        output_name = self.get_name("neg")
+        self.nodes.append(helper.make_node(
+            onnx_op, [operand_name], [output_name]
+        ))
+        return output_name
+
+    def visit_function_call(self, node):
+        name = node.name
+        if name == 'log2':
+            return self.visit_log_base(node, 2.0)
+        if name == 'log10':
+            return self.visit_log_base(node, 10.0)
+        if name == 'cbrt':
+            return self.visit_cbrt(node)
+        if name == 'deg':
+            return self.visit_deg(node)
+        if name == 'rad':
+            return self.visit_rad(node)
+        if name == 'factorial':
+            arg_name = self.visit(node.args[0])
+            return self.visit_factorial(arg_name)
+
+        arg_names = [self.visit(arg) for arg in node.args]
+        onnx_op = get_function(name)
+        output_name = self.get_name(onnx_op.lower())
+        self.nodes.append(helper.make_node(
+            onnx_op, arg_names, [output_name]
+        ))
+        return output_name
+
+    def visit_variable(self, node):
+        name = node.name
+
+        if is_constant(name):
+            const_value = get_constant(name)
+            if const_value in self.constants_seen:
+                return self.constants_seen[const_value]
+            const_name = self.get_name("const")
+            self.constants_seen[const_value] = const_name
+            self.initializers.append(
+                helper.make_tensor(
+                    const_name, TensorProto.FLOAT, [1], [float(const_value)]
+                )
+            )
+            return const_name
+
+        if name not in self.variables_seen:
+            self.variables_seen.add(name)
+
+            if self.dynamic:
+                shape = []
+            elif name in self.shapes:
+                shape = self.shapes[name]
+                self.output_shape = shape
+            else:
+                shape = [1]
+
+            self.inputs.append(
+                helper.make_tensor_value_info(
+                    name, TensorProto.FLOAT, shape
+                )
+            )
+        return name
+
+    def visit_constant(self, node):
+        value = float(node.value)
+        if value in self.constants_seen:
+            return self.constants_seen[value]
+        name = self.get_name("const")
+        self.constants_seen[value] = name
+        self.initializers.append(
+            helper.make_tensor(
+                name, TensorProto.FLOAT, [1], [value]
+            )
+        )
+        return name
+
+    def visit_log_base(self, node, base):
+        arg_name = self.visit(node.args[0])
+        if base in self.constants_seen:
+            base_name = self.constants_seen[base]
+        else:
+            base_name = self.get_name("const")
+            self.constants_seen[base] = base_name
+            self.initializers.append(
+                helper.make_tensor(
+                    base_name, TensorProto.FLOAT, [1], [base]
+                )
+            )
+        log_arg_name = self.get_name("log")
+        self.nodes.append(helper.make_node(
+            "Log", [arg_name], [log_arg_name]
+        ))
+        log_base_name = self.get_name("log")
+        self.nodes.append(helper.make_node(
+            "Log", [base_name], [log_base_name]
+        ))
+        output_name = self.get_name("div")
+        self.nodes.append(helper.make_node(
+            "Div", [log_arg_name, log_base_name], [output_name]
+        ))
+        return output_name
+
+    def visit_cbrt(self, node):
+        arg_name = self.visit(node.args[0])
+        third_value = 1.0 / 3.0
+        if third_value in self.constants_seen:
+            third_name = self.constants_seen[third_value]
+        else:
+            third_name = self.get_name("const")
+            self.constants_seen[third_value] = third_name
+            self.initializers.append(
+                helper.make_tensor(
+                    third_name, TensorProto.FLOAT, [1], [third_value]
+                )
+            )
+        output_name = self.get_name("pow")
+        self.nodes.append(helper.make_node(
+            "Pow", [arg_name, third_name], [output_name]
+        ))
+        return output_name
+
+    def visit_deg(self, node):
+        arg_name = self.visit(node.args[0])
+        factor_value = 3.141592653589793 / 180.0
+        if factor_value in self.constants_seen:
+            factor_name = self.constants_seen[factor_value]
+        else:
+            factor_name = self.get_name("const")
+            self.constants_seen[factor_value] = factor_name
+            self.initializers.append(
+                helper.make_tensor(
+                    factor_name, TensorProto.FLOAT, [1], [factor_value]
+                )
+            )
+        output_name = self.get_name("mul")
+        self.nodes.append(helper.make_node(
+            "Mul", [arg_name, factor_name], [output_name]
+        ))
+        return output_name
+
+    def visit_rad(self, node):
+        arg_name = self.visit(node.args[0])
+        factor_value = 180.0 / 3.141592653589793
+        if factor_value in self.constants_seen:
+            factor_name = self.constants_seen[factor_value]
+        else:
+            factor_name = self.get_name("const")
+            self.constants_seen[factor_value] = factor_name
+            self.initializers.append(
+                helper.make_tensor(
+                    factor_name, TensorProto.FLOAT, [1], [factor_value]
+                )
+            )
+        output_name = self.get_name("mul")
+        self.nodes.append(helper.make_node(
+            "Mul", [arg_name, factor_name], [output_name]
+        ))
+        return output_name
+
+    def visit_factorial(self, operand_name):
+        two_pi_value = 6.283185307179586
+        if two_pi_value in self.constants_seen:
+            two_pi_name = self.constants_seen[two_pi_value]
+        else:
+            two_pi_name = self.get_name("const")
+            self.constants_seen[two_pi_value] = two_pi_name
+            self.initializers.append(
+                helper.make_tensor(
+                    two_pi_name, TensorProto.FLOAT, [1], [two_pi_value]
+                )
+            )
+        e_value = 2.718281828459045
+        if e_value in self.constants_seen:
+            e_name = self.constants_seen[e_value]
+        else:
+            e_name = self.get_name("const")
+            self.constants_seen[e_value] = e_name
+            self.initializers.append(
+                helper.make_tensor(
+                    e_name, TensorProto.FLOAT, [1], [e_value]
+                )
+            )
+        two_pi_n_name = self.get_name("mul")
+        self.nodes.append(helper.make_node(
+            "Mul", [two_pi_name, operand_name], [two_pi_n_name]
+        ))
+        sqrt_name = self.get_name("sqrt")
+        self.nodes.append(helper.make_node(
+            "Sqrt", [two_pi_n_name], [sqrt_name]
+        ))
+        n_over_e_name = self.get_name("div")
+        self.nodes.append(helper.make_node(
+            "Div", [operand_name, e_name], [n_over_e_name]
+        ))
+        pow_name = self.get_name("pow")
+        self.nodes.append(helper.make_node(
+            "Pow", [n_over_e_name, operand_name], [pow_name]
+        ))
+        output_name = self.get_name("mul")
+        self.nodes.append(helper.make_node(
+            "Mul", [sqrt_name, pow_name], [output_name]
+        ))
+        return output_name
+
+    def create_output(self, output_name, output_type=TensorProto.FLOAT):
+        if self.dynamic:
+            output_shape = []
+        else:
+            output_shape = self.output_shape
+
+        self.outputs = [
+            helper.make_tensor_value_info(
+                output_name, output_type, output_shape
+            )
+        ]
+
+==================================================
+FILE: lexer.py
+==================================================
+
+from .tokens import *
+
+
+class Lexer:
+    def __init__(self, text):
+        self.text = text
+        self.pos = 0
+        self.current_char = self.text[0] if len(self.text) > 0 else None
+
+    def advance(self):
+        self.pos += 1
+        self.current_char = self.text[self.pos] if self.pos < len(self.text) else None
+
+    def peek(self):
+        peek_pos = self.pos + 1
+        return self.text[peek_pos] if peek_pos < len(self.text) else None
+
+    def is_ident_start_char(self, c):
+        return c.isalpha() or c == '_' or c in '√∂∫'
+
+    def is_ident_char(self, c):
+        return (c.isalpha() or c.isdigit() or c == '_'
+                or c in '√∂∫₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹')
+
+    def tokenize(self):
+        tokens = []
+        while self.current_char is not None:
+            if self.current_char.isspace():
+                self.advance()
+
+            elif self.current_char.isdigit() or (
+                    self.current_char == '.'
+                    and self.peek() is not None
+                    and self.peek().isdigit()):
+                tokens.append(self.handle_number())
+
+            elif self.is_ident_start_char(self.current_char):
+                tokens.append(self.handle_ident())
+
+            elif self.current_char == '∞':
+                tokens.append(Token(TT_NUMBER, float('inf')))
+                self.advance()
+
+            else:
+                token = self.handle_operator()
+                if token is None:
+                    raise Exception(f"Invalid character: {self.current_char}")
+                tokens.append(token)
+
+            if tokens and self.current_char is not None:
+                last_type = tokens[-1].type
+                if last_type in (TT_NUMBER, TT_RPAREN):
+                    if (self.current_char == '('
+                            or self.is_ident_start_char(self.current_char)
+                            or self.current_char.isdigit()
+                            or self.current_char == '.'):
+                        tokens.append(Token(TT_STAR, '*'))
+
+        tokens.append(Token(TT_EOF))
+        return tokens
+
+    def handle_number(self):
+        number_str = ''
+        dot_count = 0
+
+        while (self.current_char is not None
+               and (self.current_char.isdigit() or self.current_char == '.')):
+            if self.current_char == '.':
+                dot_count += 1
+                if dot_count > 1:
+                    raise Exception("Invalid number format")
+            number_str += self.current_char
+            self.advance()
+
+        if self.current_char is not None and self.current_char in 'eE':
+            save_pos = self.pos
+            exp_str = self.current_char
+            self.advance()
+
+            if self.current_char is not None and self.current_char in '+-':
+                exp_str += self.current_char
+                self.advance()
+
+            has_digits = False
+            while self.current_char is not None and self.current_char.isdigit():
+                has_digits = True
+                exp_str += self.current_char
+                self.advance()
+
+            if has_digits:
+                number_str += exp_str
+            else:
+                self.pos = save_pos
+                self.current_char = self.text[save_pos]
+
+        if dot_count == 0 and 'e' not in number_str.lower():
+            return Token(TT_NUMBER, int(number_str))
+        return Token(TT_NUMBER, float(number_str))
+
+    def handle_ident(self):
+        name = ''
+        while self.current_char is not None and self.is_ident_char(self.current_char):
+            name += self.current_char
+            self.advance()
+        return Token(TT_IDENT, name)
+
+    def handle_operator(self):
+        char = self.current_char
+        self.advance()
+
+        if char == '+': return Token(TT_PLUS, '+')
+        if char == '-': return Token(TT_MINUS, '-')
+        if char == '/': return Token(TT_SLASH, '/')
+        if char == '%': return Token(TT_MOD, '%')
+        if char == ',': return Token(TT_COMMA, ',')
+        if char == ':': return Token(TT_COLON, ':')
+        if char == '(': return Token(TT_LPAREN, '(')
+        if char == ')': return Token(TT_RPAREN, ')')
+        if char == '[': return Token(TT_LBRACKET, '[')
+        if char == ']': return Token(TT_RBRACKET, ']')
+        if char == '^': return Token(TT_CARET, '^')
+        if char == '|': return Token(TT_PIPE, '|')
+
+        if char == '*':
+            if self.current_char == '*':
+                self.advance()
+                return Token(TT_CARET, '^')
+            return Token(TT_STAR, '*')
+
+        if char == '=':
+            if self.current_char == '=':
+                self.advance()
+                return Token(TT_EQ, '==')
+            return Token(TT_ASSIGN, '=')
+
+        if char == '!':
+            if self.current_char == '=':
+                self.advance()
+                return Token(TT_NEQ, '!=')
+            return Token(TT_FACT, '!')
+
+        if char == '<':
+            if self.current_char == '=':
+                self.advance()
+                return Token(TT_LTE, '<=')
+            return Token(TT_LT, '<')
+
+        if char == '>':
+            if self.current_char == '=':
+                self.advance()
+                return Token(TT_GTE, '>=')
+            return Token(TT_GT, '>')
+
+        return None
+
+==================================================
+FILE: optimizer.py
+==================================================
+
+import math
+from .ast_nodes import *
+
+
+class Optimizer:
+    def optimize(self, node):
+        if isinstance(node, BinaryOp):
+            return self.optimize_binary_op(node)
+        if isinstance(node, UnaryOp):
+            return self.optimize_unary_op(node)
+        if isinstance(node, FunctionCall):
+            return self.optimize_function_call(node)
+        if isinstance(node, Variable):
+            return node
+        if isinstance(node, Constant):
+            return node
+        raise Exception(f"Unknown node type: {type(node)}")
+
+    def optimize_binary_op(self, node):
+        left = self.optimize(node.left)
+        right = self.optimize(node.right)
+
+        if self.is_constant_value(left, 0) and node.op in ('+', '-'):
+            if node.op == '+':
+                return right
+            if node.op == '-':
+                return UnaryOp("-", right)
+
+        if self.is_constant_value(right, 0) and node.op in ('+', '-'):
+            return left
+
+        if self.is_constant_value(left, 1) and node.op == '*':
+            return right
+
+        if self.is_constant_value(right, 1) and node.op in ('*', '/'):
+            return left
+
+        if self.is_constant_value(left, 0) and node.op in ('*', '/'):
+            if node.op == '*':
+                return Constant(0)
+            if node.op == '/':
+                raise Exception("Division by zero")
+
+        if self.is_constant_value(right, 0) and node.op == '*':
+            return Constant(0)
+
+        if self.is_constant_value(right, 0) and node.op == '/':
+            raise Exception("Division by zero")
+
+        if self.is_constant_value(right, 0) and node.op == '^':
+            return Constant(1)
+
+        if self.is_constant_value(right, 1) and node.op == '^':
+            return left
+
+        if self.is_constant_value(left, 0) and node.op == '^':
+            return Constant(0)
+
+        if self.is_constant_value(left, 1) and node.op == '^':
+            return Constant(1)
+
+        if self.is_constant_value(left, 1) and node.op == '*':
+            return right
+
+        if isinstance(left, Constant) and isinstance(right, Constant):
+            return self.fold_constants(left, node.op, right)
+
+        return BinaryOp(left, node.op, right)
+
+    def optimize_unary_op(self, node):
+        operand = self.optimize(node.operand)
+
+        if node.op == '+':
+            return operand
+
+        if isinstance(operand, UnaryOp) and operand.op == '-':
+            return operand.operand
+
+        if isinstance(operand, Constant):
+            if node.op == '-':
+                return Constant(-operand.value)
+
+        return UnaryOp(node.op, operand)
+
+    def optimize_function_call(self, node):
+        args = [self.optimize(arg) for arg in node.args]
+
+        if all(isinstance(arg, Constant) for arg in args):
+            return self.fold_function(node.name, args)
+
+        return FunctionCall(node.name, args)
+
+    def is_constant_value(self, node, value):
+        if isinstance(node, Constant):
+            return node.value == value
+        return False
+
+    def fold_constants(self, left, op, right):
+        a = left.value
+        b = right.value
+
+        if op == '+': result = a + b
+        elif op == '-': result = a - b
+        elif op == '*': result = a * b
+        elif op == '/':
+            if b == 0:
+                raise Exception("Division by zero")
+            result = a / b
+        elif op == '^': result = a ** b
+        elif op == '%':
+            if b == 0:
+                raise Exception("Modulo by zero")
+            result = a % b
+        elif op == '<': result = float(a < b)
+        elif op == '>': result = float(a > b)
+        elif op == '<=': result = float(a <= b)
+        elif op == '>=': result = float(a >= b)
+        elif op == '==': result = float(a == b)
+        elif op == '!=': result = float(a != b)
+        else:
+            return BinaryOp(left, op, right)
+
+        return Constant(result)
+
+    def fold_function(self, name, args):
+        values = [arg.value for arg in args]
+
+        try:
+            if name == 'sin': result = math.sin(values[0])
+            elif name == 'cos': result = math.cos(values[0])
+            elif name == 'tan': result = math.tan(values[0])
+            elif name == 'asin': result = math.asin(values[0])
+            elif name == 'acos': result = math.acos(values[0])
+            elif name == 'atan': result = math.atan(values[0])
+            elif name == 'atan2': result = math.atan2(values[0], values[1])
+            elif name == 'sinh': result = math.sinh(values[0])
+            elif name == 'cosh': result = math.cosh(values[0])
+            elif name == 'tanh': result = math.tanh(values[0])
+            elif name == 'asinh': result = math.asinh(values[0])
+            elif name == 'acosh': result = math.acosh(values[0])
+            elif name == 'atanh': result = math.atanh(values[0])
+            elif name == 'exp': result = math.exp(values[0])
+            elif name == 'log': result = math.log(values[0])
+            elif name == 'ln': result = math.log(values[0])
+            elif name == 'log2': result = math.log2(values[0])
+            elif name == 'log10': result = math.log10(values[0])
+            elif name == 'sqrt': result = math.sqrt(values[0])
+            elif name == 'cbrt': result = values[0] ** (1.0/3.0)
+            elif name == 'abs': result = abs(values[0])
+            elif name == 'floor': result = float(math.floor(values[0]))
+            elif name == 'ceil': result = float(math.ceil(values[0]))
+            elif name == 'round': result = float(round(values[0]))
+            elif name == 'sign':
+                if values[0] > 0: result = 1.0
+                elif values[0] < 0: result = -1.0
+                else: result = 0.0
+            elif name == 'pow': result = values[0] ** values[1]
+            elif name == 'max': result = max(values)
+            elif name == 'min': result = min(values)
+            elif name == 'relu': result = max(0.0, values[0])
+            elif name == 'sigmoid': result = 1.0 / (1.0 + math.exp(-values[0]))
+            elif name == 'erf': result = math.erf(values[0])
+            elif name == 'reciprocal': result = 1.0 / values[0]
+            elif name == 'factorial': result = float(math.factorial(int(values[0])))
+            elif name == 'deg': result = math.degrees(values[0])
+            elif name == 'rad': result = math.radians(values[0])
+            elif name == 'neg': result = -values[0]
+            else:
+                return FunctionCall(name, args)
+            return Constant(result)
+        except (ValueError, OverflowError, ZeroDivisionError):
+            return FunctionCall(name, args)
+
+==================================================
+FILE: op_registry.py
+==================================================
+
+BINARY_OPS = {
+    '+': 'Add',
+    '-': 'Sub',
+    '*': 'Mul',
+    '/': 'Div',
+    '^': 'Pow',
+    '%': 'Mod',
+}
+
+UNARY_OPS = {
+    '-': 'Neg',
+    '+': None,
+}
+
+COMPARISON_OPS = {
+    '<': 'Less',
+    '>': 'Greater',
+    '<=': 'LessOrEqual',
+    '>=': 'GreaterOrEqual',
+    '==': 'Equal',
+    '!=': 'NotEqual',
+}
+
+FUNCTIONS = {
+    'sin': 'Sin',
+    'cos': 'Cos',
+    'tan': 'Tan',
+    'asin': 'Asin',
+    'acos': 'Acos',
+    'atan': 'Atan',
+    'sinh': 'Sinh',
+    'cosh': 'Cosh',
+    'tanh': 'Tanh',
+    'asinh': 'Asinh',
+    'acosh': 'Acosh',
+    'atanh': 'Atanh',
+    'exp': 'Exp',
+    'log': 'Log',
+    'ln': 'Log',
+    'sqrt': 'Sqrt',
+    'abs': 'Abs',
+    'floor': 'Floor',
+    'ceil': 'Ceil',
+    'round': 'Round',
+    'sign': 'Sign',
+    'pow': 'Pow',
+    'max': 'Max',
+    'min': 'Min',
+    'relu': 'Relu',
+    'sigmoid': 'Sigmoid',
+    'erf': 'Erf',
+    'clip': 'Clip',
+    'neg': 'Neg',
+    'reciprocal': 'Reciprocal',
+}
+
+SPECIAL_FUNCTIONS = {
+    'log2': 'log_base',
+    'log10': 'log_base',
+    'cbrt': 'cbrt',
+    'factorial': 'factorial',
+    'deg': 'deg',
+    'rad': 'rad',
+}
+
+CONSTANTS = {
+    'pi': 3.141592653589793,
+    'π': 3.141592653589793,
+    'euler': 2.718281828459045,
+    'phi': 1.618033988749895,
+    'φ': 1.618033988749895,
+    'speed_of_light': 299792458.0,
+    'planck': 6.62607015e-34,
+    'planck_reduced': 1.054571817e-34,
+    'gravitational': 6.67430e-11,
+    'boltzmann': 1.380649e-23,
+    'avogadro': 6.02214076e+23,
+    'electron_charge': 1.602176634e-19,
+    'vacuum_permittivity': 8.8541878128e-12,
+    'vacuum_permeability': 1.25663706212e-6,
+    'inf': float('inf'),
+    'infinity': float('inf'),
+    '∞': float('inf'),
+    'nan': float('nan'),
+}
+
+
+def get_opset_version():
+    return 18
+
+
+def get_binary_op(op):
+    if op in BINARY_OPS:
+        return BINARY_OPS[op]
+    raise Exception(f"Unknown binary operator: {op}")
+
+
+def get_unary_op(op):
+    if op in UNARY_OPS:
+        return UNARY_OPS[op]
+    raise Exception(f"Unknown unary operator: {op}")
+
+
+def get_comparison_op(op):
+    if op in COMPARISON_OPS:
+        return COMPARISON_OPS[op]
+    raise Exception(f"Unknown comparison operator: {op}")
+
+
+def get_function(name):
+    if name in FUNCTIONS:
+        return FUNCTIONS[name]
+    if name in SPECIAL_FUNCTIONS:
+        return SPECIAL_FUNCTIONS[name]
+    raise Exception(f"Unknown function: {name}")
+
+
+def get_constant(name):
+    if name in CONSTANTS:
+        return CONSTANTS[name]
+    return None
+
+
+def is_special_function(name):
+    return name in SPECIAL_FUNCTIONS
+
+
+def is_constant(name):
+    return name in CONSTANTS
+
+==================================================
+FILE: parser.py
+==================================================
+
+from .ast_nodes import *
+from .tokens import *
+
+
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.pos = 0
+        self.current_token = self.tokens[self.pos]
+
+    def advance(self):
+        self.pos += 1
+        if self.pos < len(self.tokens):
+            self.current_token = self.tokens[self.pos]
+        else:
+            self.current_token = None
+
+    def peek(self):
+        peek_pos = self.pos + 1
+        if peek_pos < len(self.tokens):
+            return self.tokens[peek_pos]
+        return None
+
+    def expect(self, token_type):
+        if self.current_token.type == token_type:
+            self.advance()
+        else:
+            raise Exception(
+                f"Expected {token_type}, got {self.current_token}"
+            )
+
+    def parse(self):
+        result = self.parse_comparison()
+        if self.current_token.type != TT_EOF:
+            raise Exception(
+                f"Unexpected token: {self.current_token}"
+            )
+        return result
+
+    def parse_comparison(self):
+        left = self.parse_expression()
+
+        while self.current_token.type in (
+            TT_LT, TT_GT, TT_LTE, TT_GTE, TT_EQ, TT_NEQ
+        ):
+            op = self.current_token.value
+            self.advance()
+            right = self.parse_expression()
+            left = BinaryOp(left, op, right)
+
+        return left
+
+    def parse_expression(self):
+        left = self.parse_term()
+
+        while self.current_token.type in (TT_PLUS, TT_MINUS):
+            op = self.current_token.value
+            self.advance()
+            right = self.parse_term()
+            left = BinaryOp(left, op, right)
+
+        return left
+
+    def parse_term(self):
+        left = self.parse_factor()
+
+        while self.current_token.type in (TT_STAR, TT_SLASH, TT_MOD):
+            op = self.current_token.value
+            self.advance()
+            right = self.parse_factor()
+            left = BinaryOp(left, op, right)
+
+        return left
+
+    def parse_factor(self):
+        if self.current_token.type == TT_MINUS:
+            self.advance()
+            operand = self.parse_factor()
+            return UnaryOp("-", operand)
+
+        if self.current_token.type == TT_PLUS:
+            self.advance()
+            operand = self.parse_factor()
+            return UnaryOp("+", operand)
+
+        left = self.parse_function()
+
+        while self.current_token.type == TT_FACT:
+            self.advance()
+            left = FunctionCall("factorial", [left])
+
+        if self.current_token.type == TT_CARET:
+            self.advance()
+            right = self.parse_factor()
+            return BinaryOp(left, "^", right)
+
+        return left
+
+    def parse_function(self):
+        if (self.current_token.type == TT_IDENT
+                and self.peek() is not None
+                and self.peek().type == TT_LPAREN):
+
+            name = self.current_token.value
+            self.advance()
+            self.advance()
+
+            args = []
+            if self.current_token.type != TT_RPAREN:
+                args.append(self.parse_expression())
+                while self.current_token.type == TT_COMMA:
+                    self.advance()
+                    args.append(self.parse_expression())
+
+            self.expect(TT_RPAREN)
+            return FunctionCall(name, args)
+
+        return self.parse_primary()
+
+    def parse_primary(self):
+        token = self.current_token
+
+        if token.type == TT_NUMBER:
+            self.advance()
+            return Constant(token.value)
+
+        if token.type == TT_IDENT:
+            self.advance()
+            return Variable(token.value)
+
+        if token.type == TT_LPAREN:
+            self.advance()
+            node = self.parse_expression()
+            self.expect(TT_RPAREN)
+            return node
+
+        if token.type == TT_PIPE:
+            self.advance()
+            node = self.parse_expression()
+            self.expect(TT_PIPE)
+            return FunctionCall("abs", [node])
+
+        raise Exception(f"Unexpected token: {token}")
+
+==================================================
+FILE: tokens.py
+==================================================
+
+TT_PLUS     = 'PLUS'
+TT_MINUS    = 'MINUS'
+TT_STAR     = 'STAR'
+TT_SLASH    = 'SLASH'
+TT_CARET    = 'CARET'
+TT_MOD      = 'MOD'
+TT_FACT     = 'FACT'
+TT_COMMA    = 'COMMA'
+TT_COLON    = 'COLON'
+TT_LPAREN   = 'LPAREN'
+TT_RPAREN   = 'RPAREN'
+TT_LBRACKET = 'LBRACKET'
+TT_RBRACKET = 'RBRACKET'
+TT_PIPE     = 'PIPE'
+TT_NUMBER   = 'NUMBER'
+TT_IDENT    = 'IDENT'
+TT_EOF      = 'EOF'
+TT_EQ       = 'EQ'
+TT_NEQ      = 'NEQ'
+TT_LT       = 'LT'
+TT_GT       = 'GT'
+TT_LTE      = 'LTE'
+TT_GTE      = 'GTE'
+TT_ASSIGN   = 'ASSIGN'
+
+
+class Token:
+    def __init__(self, type, value=None):
+        self.type = type
+        self.value = value
+
+    def __repr__(self):
+        if self.value is not None:
+            return f'{self.type}:{self.value}'
+        return f'{self.type}'
+
+==================================================
+FILE: utils.py
+==================================================
+
+import numpy as np
+from onnx import TensorProto
+
+
+DTYPE_MAP = {
+    'float32': TensorProto.FLOAT,
+    'float': TensorProto.FLOAT,
+    'float64': TensorProto.DOUBLE,
+    'int32': TensorProto.INT32,
+    'int': TensorProto.INT64,
+    'int64': TensorProto.INT64,
+    'bool': TensorProto.BOOL,
+    'string': TensorProto.STRING,
+}
+
+DTYPE_NAMES = {
+    1: 'FLOAT',
+    2: 'UINT8',
+    3: 'INT8',
+    5: 'INT16',
+    6: 'INT32',
+    7: 'INT64',
+    9: 'BOOL',
+    10: 'FLOAT16',
+    11: 'DOUBLE',
+}
+
+
+def infer_shape(value):
+    if isinstance(value, (int, float)):
+        return [1]
+    if isinstance(value, list):
+        return [len(value)]
+    if isinstance(value, np.ndarray):
+        return list(value.shape)
+    return [1]
+
+
+def dtype_mapping(value):
+    if isinstance(value, float):
+        return TensorProto.FLOAT
+    if isinstance(value, int):
+        return TensorProto.INT64
+    if isinstance(value, bool):
+        return TensorProto.BOOL
+    if isinstance(value, np.ndarray):
+        return DTYPE_MAP.get(str(value.dtype), TensorProto.FLOAT)
+    if isinstance(value, str):
+        dtype_str = value.lower()
+        if dtype_str in DTYPE_MAP:
+            return DTYPE_MAP[dtype_str]
+    return TensorProto.FLOAT
+
+
+def format_shape(tensor_info):
+    if not tensor_info.type.HasField('tensor_type'):
+        return 'unknown'
+
+    tensor_type = tensor_info.type.tensor_type
+    if not tensor_type.HasField('shape'):
+        return 'dynamic'
+
+    shape = tensor_type.shape
+    if shape is None or len(shape.dim) == 0:
+        return 'dynamic'
+
+    parts = []
+    for dim in shape.dim:
+        if dim.HasField('dim_param'):
+            parts.append(dim.dim_param)
+        elif dim.HasField('dim_value'):
+            parts.append(str(dim.dim_value))
+        else:
+            parts.append('?')
+
+    return '[' + ', '.join(parts) + ']'
+
+
+def pretty_print(model):
+    graph = model.graph
+
+    print("=" * 50)
+    print("ONNX MODEL STRUCTURE")
+    print("=" * 50)
+
+    print(f"\nOpset: {model.opset_import[0].version}")
+
+    print(f"\nInputs ({len(graph.input)}):")
+    for inp in graph.input:
+        shape_str = format_shape(inp)
+        dtype = DTYPE_NAMES.get(inp.type.tensor_type.elem_type,
+                                str(inp.type.tensor_type.elem_type))
+        dynamic = " DYNAMIC" if 'dynamic' in shape_str.lower() or '?' in shape_str else ""
+        print(f"  {inp.name:15s}  shape={shape_str:15s}  dtype={dtype}{dynamic}")
+
+    print(f"\nInitializers ({len(graph.initializer)}):")
+    for init in graph.initializer:
+        if init.float_data:
+            vals = list(init.float_data)
+        elif init.int64_data:
+            vals = list(init.int64_data)
+        elif init.int32_data:
+            vals = list(init.int32_data)
+        else:
+            vals = []
+        print(f"  {init.name:15s}  value={vals}")
+
+    print(f"\nNodes ({len(graph.node)}):")
+    for i, node in enumerate(graph.node):
+        inputs = ", ".join(node.input)
+        outputs = ", ".join(node.output)
+        attrs = ""
+        if node.attribute:
+            parts = []
+            for attr in node.attribute:
+                parts.append(f"{attr.name}={attr.i if attr.i else attr.f}")
+            attrs = f"  [{', '.join(parts)}]"
+        print(f"  [{i:>3d}] {node.op_type:20s}({inputs}) → {outputs}{attrs}")
+
+    print(f"\nOutputs ({len(graph.output)}):")
+    for out in graph.output:
+        shape_str = format_shape(out)
+        dtype = DTYPE_NAMES.get(out.type.tensor_type.elem_type,
+                                str(out.type.tensor_type.elem_type))
+        print(f"  {out.name:15s}  shape={shape_str:15s}  dtype={dtype}")
+
+    print("=" * 50)
+
+==================================================
+FILE: __init__.py
+==================================================
+
+import numpy as np
+from .lexer import Lexer
+from .parser import Parser
+from .optimizer import Optimizer
+from .graph_builder import GraphBuilder
+from .exporter import Exporter
+from .executor import Executor
+from .utils import pretty_print
+
+
+def from_formula(formula, shapes=None, dynamic=False):
+    tokens = Lexer(formula).tokenize()
+    ast = Parser(tokens).parse()
+    opt = Optimizer()
+    ast = opt.optimize(ast)
+    builder = GraphBuilder(shapes=shapes, dynamic=dynamic)
+    model = builder.build(ast)
+    exporter = Exporter()
+    exporter.validate(model)
+    return model
+
+
+def save(formula, filepath="formula.onnx", shapes=None, dynamic=False):
+    model = from_formula(formula, shapes, dynamic)
+    exporter = Exporter()
+    exporter.export_to_file(model, filepath)
+    return filepath
+
+
+def run(formula, inputs, model_path="formula.onnx", shapes=None, dynamic=True):
+    if shapes is None and not dynamic:
+        shapes = {}
+        for name, value in inputs.items():
+            if isinstance(value, np.ndarray):
+                shapes[name] = list(value.shape)
+            elif isinstance(value, (list, tuple)):
+                shapes[name] = [len(value)]
+
+    save(formula, model_path, shapes, dynamic)
+    executor = Executor()
+    executor.create_session(model_path)
+    return executor.run(inputs)
+
+
+def benchmark(formula, inputs, runs=1000, model_path="formula.onnx",
+              shapes=None, dynamic=True):
+    if shapes is None and not dynamic:
+        shapes = {}
+        for name, value in inputs.items():
+            if isinstance(value, np.ndarray):
+                shapes[name] = list(value.shape)
+            elif isinstance(value, (list, tuple)):
+                shapes[name] = [len(value)]
+
+    save(formula, model_path, shapes, dynamic)
+    executor = Executor()
+    executor.create_session(model_path)
+    return executor.benchmark(inputs, runs)
+
+
+def describe(formula, shapes=None, dynamic=False):
+    model = from_formula(formula, shapes, dynamic)
+    pretty_print(model)
+    return model
