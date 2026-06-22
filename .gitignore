@@ -1,18 +1,36 @@
-__pycache__/
+```
+# Compiled and build artifacts
+*.onnx
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
+*.o
+*.obj
 *.so
 *.dll
 *.exe
-*.o
-*.onnx
-.eggs/
-*.egg
+
+# Dependencies
+.venv/
 venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
 .env
-.DS_Store
-Thumbs.db
-.txt
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Build directories
+build/
+dist/
+target/
+```
