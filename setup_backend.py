@@ -5,8 +5,8 @@ module = Extension(
     'lattice_backend',
     sources=['lattice/lattice_backend.c'],
     include_dirs=[np.get_include()],
-    extra_compile_args=['-O3', '-ffast-math'],
-    extra_link_args=['-lm'],
+    extra_compile_args=['-O3', '-ffast-math', '-march=native', '-fopenmp'],
+    extra_link_args=['-lm', '-fopenmp'],
 )
 
 setup(
