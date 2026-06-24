@@ -39,7 +39,7 @@ def run_c_kernel(op_name, inputs, size):
         return None
 
 
-def benchmark_operation(name, formula, variables, op_type=None, data_size=1_000_000, iterations=10):
+def benchmark_operation(name, formula, variables, op_type=None, data_size=10_000_000, iterations=10):
     """
     Benchmark a single operation for NumPy, ONNX, and C backend.
     """
@@ -157,6 +157,10 @@ def main():
         
         # Fused Operations (where C backend should shine)
         ("FMA (Fused Multiply-Add)", "a * b + c", ["a", "b", "c"], "fma"),
+        ("Fused Hypot", "sqrt(a**2 + b**2)", ["a", "b"], "fused_hypot"),
+        ("Fused Sin2+Cos2", "sin(a)**2 + cos(a)**2", ["a"], "fused_sin2cos2"),
+        ("Fused Exp Decay", "a * exp(-b * c)", ["a", "b", "c"], "fused_exp_decay"),
+        ("Fused Gaussian", "a * exp(-0.5 * ((d - b) / c)**2)", ["a", "b", "c", "d"], "fused_gaussian"),
         
         # Math Functions
         ("Sine", "sin(a)", ["a"], "sin"),
