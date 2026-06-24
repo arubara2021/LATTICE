@@ -2,19 +2,23 @@
 #include <numpy/arrayobject.h>
 #include <math.h>
 #include <stdio.h>
+#include <omp.h>
 
 // Helper macros for math functions to handle float/double
 #define UNARY_OP_LOOP(out, in, size, func) \
+    _Pragma("omp parallel for simd") \
     for (npy_intp i = 0; i < size; i++) { \
         out[i] = func(in[i]); \
     }
 
 #define BINARY_OP_LOOP(out, in1, in2, size, op) \
+    _Pragma("omp parallel for simd") \
     for (npy_intp i = 0; i < size; i++) { \
         out[i] = in1[i] op in2[i]; \
     }
 
 #define TERNARY_OP_LOOP(out, in1, in2, in3, size, expr) \
+    _Pragma("omp parallel for simd") \
     for (npy_intp i = 0; i < size; i++) { \
         out[i] = expr; \
     }
@@ -38,6 +42,7 @@ static void kernel_div(double *out, double *in1, double *in2, npy_intp size) {
 }
 
 static void kernel_pow(double *out, double *in1, double *in2, npy_intp size) {
+    _Pragma("omp parallel for simd")
     for (npy_intp i = 0; i < size; i++) {
         out[i] = pow(in1[i], in2[i]);
     }
@@ -72,12 +77,14 @@ static void kernel_abs(double *out, double *in, npy_intp size) {
 }
 
 static void kernel_neg(double *out, double *in, npy_intp size) {
+    _Pragma("omp parallel for simd")
     for (npy_intp i = 0; i < size; i++) {
         out[i] = -in[i];
     }
 }
 
 static void kernel_constant(double *out, double val, npy_intp size) {
+    _Pragma("omp parallel for simd")
     for (npy_intp i = 0; i < size; i++) {
         out[i] = val;
     }
@@ -86,6 +93,7 @@ static void kernel_constant(double *out, double val, npy_intp size) {
 // --- Fused Kernels (The Secret Sauce for Speed) ---
 // Example: Fused Multiply-Add (a * b + c)
 static void kernel_fma(double *out, double *in1, double *in2, double *in3, npy_intp size) {
+    _Pragma("omp parallel for simd")
     for (npy_intp i = 0; i < size; i++) {
         out[i] = (in1[i] * in2[i]) + in3[i];
     }
@@ -93,6 +101,7 @@ static void kernel_fma(double *out, double *in1, double *in2, double *in3, npy_i
 
 // Example: Fused Activation (sin(x * w) + b)
 static void kernel_fused_sin_linear(double *out, double *in, double *w, double *b, npy_intp size) {
+    _Pragma("omp parallel for simd")
     for (npy_intp i = 0; i < size; i++) {
         out[i] = sin(in[i] * w[i]) + b[i];
     }
