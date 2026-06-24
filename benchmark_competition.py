@@ -39,14 +39,14 @@ def run_c_kernel(op_name, inputs, size):
         return None
 
 
-def benchmark_operation(name, formula, variables, op_type=None, data_size=10_000_000, iterations=10):
+def benchmark_operation(name, formula, variables, op_type=None, data_size=10_000_000, iterations=10, dtype=np.float64):
     """
     Benchmark a single operation for NumPy, ONNX, and C backend.
     """
     print(f"\n{'='*60}")
     print(f"Benchmark: {name}")
     print(f"Formula: {formula}")
-    print(f"Data size: {data_size:,} elements")
+    print(f"Data size: {data_size:,} elements | dtype: {dtype.__name__}")
     print(f"{'='*60}")
     
     # Generate random input data
@@ -54,7 +54,7 @@ def benchmark_operation(name, formula, variables, op_type=None, data_size=10_000
     inputs_dict = {}
     inputs_list = []
     for var in variables:
-        arr = np.random.rand(data_size).astype(np.float64)
+        arr = np.random.rand(data_size).astype(dtype)
         inputs_dict[var] = arr
         inputs_list.append(arr)
     
@@ -144,11 +144,15 @@ def benchmark_operation(name, formula, variables, op_type=None, data_size=10_000
 
 def main():
     print("="*70)
-    print(" " * 15 + "FORMULA2ONNX vs NUMPY BENCHMARK")
+    print(" " * 15 + "FORMULA2ONNX vs NUMPY STRESS TEST BENCHMARK")
     print(" " * 15 + "(C Backend Performance Comparison)")
     print("="*70)
     
-    benchmarks = [
+    # Test configurations
+    sizes = [10_000_000, 50_000_000]
+    dtypes = [np.float32, np.float64]
+
+    base_benchmarks = [
         # Basic Operations with their C kernel types
         ("Addition", "a + b", ["a", "b"], "add"),
         ("Subtraction", "a - b", ["a", "b"], "sub"),
@@ -169,41 +173,64 @@ def main():
         ("Square Root", "sqrt(a)", ["a"], "sqrt"),
     ]
     
-    results = []
+    all_results = []
     
-    for bench in benchmarks:
-        name, formula, vars_list, op_type = bench
-        result = benchmark_operation(name, formula, vars_list, op_type=op_type)
-        if result:
-            results.append(result)
-    
+    for dtype in dtypes:
+        for size in sizes:
+            print(f"\n\n{'*'*80}")
+            print(f"*** STRESS TEST: {size:,} elements | {dtype.__name__} ***")
+            print(f"{'*'*80}")
+
+            results = []
+            for bench in base_benchmarks:
+                name, formula, vars_list, op_type = bench
+
+                # Reduce iterations for 50M to save time
+                iters = 5 if size > 10_000_000 else 10
+
+                result = benchmark_operation(name, formula, vars_list, op_type=op_type, data_size=size, iterations=iters, dtype=dtype)
+                if result:
+                    result['size'] = size
+                    result['dtype'] = dtype.__name__
+                    results.append(result)
+                    all_results.append(result)
+
+            print("\n" + "="*70)
+            print(f"SUMMARY FOR {size:,} elements | {dtype.__name__}")
+            print("="*70)
+            print(f"{'Operation':<35} {'NumPy(ms)':>10} {'Lattice(ms)':>12} {'Speedup':>10}")
+            print("-"*70)
+
+            total_numpy = 0
+            total_lattice = 0
+
+            for r in results:
+                if r and r['c_time'] is not None:
+                    total_numpy += r['numpy_time']
+                    total_lattice += r['c_time']
+                    status = "✅" if r['correct'] else "❌"
+                    print(f"{r['name']:<35} {r['numpy_time']:>10.4f} {r['c_time']:>12.4f} {r['speedup']:>8.2f}x {status}")
+
+            print("-"*70)
+            overall_speedup = total_numpy / total_lattice if total_lattice > 0 else 0
+            print(f"{'TOTAL':<35} {total_numpy:>10.4f} {total_lattice:>12.4f} {overall_speedup:>8.2f}x")
+            print("="*70)
+
     print("\n" + "="*70)
-    print("SUMMARY")
+    print("GLOBAL SUMMARY ACROSS ALL STRESS TESTS")
     print("="*70)
-    print(f"{'Operation':<35} {'NumPy(ms)':>10} {'Lattice(ms)':>12} {'Speedup':>10}")
-    print("-"*70)
     
-    total_numpy = 0
-    total_lattice = 0
-    
-    for r in results:
-        if r and r['c_time'] is not None:
-            total_numpy += r['numpy_time']
-            total_lattice += r['c_time']
-            status = "✅" if r['correct'] else "❌"
-            print(f"{r['name']:<35} {r['numpy_time']:>10.4f} {r['c_time']:>12.4f} {r['speedup']:>8.2f}x {status}")
-    
-    print("-"*70)
+    total_numpy = sum(r['numpy_time'] for r in all_results if r and r['c_time'] is not None)
+    total_lattice = sum(r['c_time'] for r in all_results if r and r['c_time'] is not None)
     overall_speedup = total_numpy / total_lattice if total_lattice > 0 else 0
-    print(f"{'TOTAL':<35} {total_numpy:>10.4f} {total_lattice:>12.4f} {overall_speedup:>8.2f}x")
-    print("="*70)
+    print(f"Overall Speedup across all tests: {overall_speedup:.2f}x")
     
     if overall_speedup > 1.0:
-        print(f"\n🎉 C backend is {overall_speedup:.2f}x faster overall!")
+        print(f"🎉 C backend is {overall_speedup:.2f}x faster overall!")
     elif overall_speedup < 1.0 and overall_speedup > 0:
-        print(f"\n⚠️  NumPy is {1/overall_speedup:.2f}x faster overall.")
+        print(f"⚠️  NumPy is {1/overall_speedup:.2f}x faster overall.")
     else:
-        print("\n⚠️  No C backend results available.")
+        print("⚠️  No C backend results available.")
     
     print("\nNote: The C backend shows maximum benefit on fused operations")
     print("      where multiple calculations are combined into a single kernel.")
